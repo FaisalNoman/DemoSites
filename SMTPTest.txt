@@ -1,0 +1,355 @@
+<#
+  Collect-SmtpDiag.ps1
+  One-shot diagnostics for: IIS SMTP (local relay) -> smart host over STARTTLS, mail stuck in Queue.
+
+  Run in an *Administrator* PowerShell on the BizTalk server:
+
+    powershell -ExecutionPolicy Bypass -File C:\Temp\Collect-SmtpDiag.ps1 -LiveTest
+
+  -LiveTest : restarts the SMTPSVC service, sends one test mail through 127.0.0.1:25,
+              watches outbound TCP connections for 90s and captures Windows Filtering
+              Platform (firewall) blocks. Audit policy is restored afterwards.
+  Without -LiveTest the script is read-only.
+
+  Output: printed on screen AND saved to C:\Temp\SmtpDiag\SmtpDiag-<timestamp>.txt
+  No passwords are printed.
+#>
+param(
+  [switch]$LiveTest,
+  [string]$RelayName    = 'mailrelay.eu.smtptestnet.com',
+  [int]   $RelayPort    = 587,
+  [string[]]$ExtraHosts = @('server.eu.smtptestnet.com'),
+  [string]$From         = 'noreplysydney@smtptestbank.com',
+  [string]$To           = 'faisal.kamali@smtptestbank.com',
+  [int]   $WatchSeconds = 90,
+  [string]$OutDir       = 'C:\Temp\SmtpDiag'
+)
+
+$ErrorActionPreference = 'Continue'
+New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+$stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
+$outFile = Join-Path $OutDir "SmtpDiag-$stamp.txt"
+Start-Transcript -Path $outFile -Force | Out-Null
+
+function Section($t) { Write-Host ""; Write-Host ("=" * 90); Write-Host "== $t"; Write-Host ("=" * 90) }
+function Show($o)    { if ($null -ne $o) { $o | Format-Table -AutoSize -Wrap | Out-String -Width 250 | Write-Host } else { Write-Host "(none)" } }
+function ShowList($o){ if ($null -ne $o) { $o | Format-List | Out-String -Width 250 | Write-Host } else { Write-Host "(none)" } }
+
+$summary = [ordered]@{}
+
+# ---------------------------------------------------------------------------
+Section "1. SYSTEM"
+$os = Get-CimInstance Win32_OperatingSystem
+Write-Host "Host      : $env:COMPUTERNAME"
+Write-Host "OS        : $($os.Caption)  $($os.Version)"
+Write-Host "Run as    : $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+Write-Host "Time      : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')  (UTC $((Get-Date).ToUniversalTime().ToString('HH:mm:ss')))"
+Show (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' } | Select-Object IPAddress, InterfaceAlias, PrefixLength)
+Show (Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses } | Select-Object InterfaceAlias, @{n='DnsServers';e={$_.ServerAddresses -join ', '}})
+Write-Host "WinHTTP proxy (used by SYSTEM):"
+netsh winhttp show proxy | Write-Host
+Write-Host "Hosts file (non-comment lines):"
+Get-Content "$env:windir\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue | Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object { Write-Host "  $_" }
+
+# ---------------------------------------------------------------------------
+Section "2. SMTP SERVICE"
+$svc = Get-CimInstance Win32_Service -Filter "Name='SMTPSVC'"
+if ($svc) {
+  Show ($svc | Select-Object Name, State, StartMode, ProcessId, StartName, PathName)
+  $p = Get-Process -Id $svc.ProcessId -ErrorAction SilentlyContinue
+  if ($p) { Write-Host "SMTPSVC runs inside process: $($p.Name)  ($($p.Path))"; $summary['SMTP process'] = $p.Name }
+  $summary['SMTPSVC'] = "$($svc.State) / $($svc.StartMode)"
+} else { Write-Host "SMTPSVC service NOT found"; $summary['SMTPSVC'] = 'NOT FOUND' }
+
+# ---------------------------------------------------------------------------
+Section "3. SMTP VIRTUAL SERVER CONFIG (live, via ADSI)"
+$vs = $null
+try { $vs = [ADSI]"IIS://localhost/SMTPSVC/1"; $null = $vs.Name } catch { Write-Host "ADSI read failed: $($_.Exception.Message)"; $vs = $null }
+$props = 'ServerState','ServerBindings','FullyQualifiedDomainName','DefaultDomain','SmartHost','SmartHostType',
+         'RemoteSmtpPort','RemoteSecurePort','RemoteTimeout','MaxOutConnections','MaxOutConnectionsPerDomain',
+         'RouteAction','RouteUserName','AuthFlags','RelayForAuth','HopCount','MasqueradeDomain',
+         'LogType','LogFileDirectory','QueueDirectory','BadMailDirectory','DropDirectory','PickupDirectory',
+         'RemoteRetryTime','RemoteNDRTime','ShouldDeliver','AlwaysUseSsl','LimitRemoteConnections'
+$cfg = [ordered]@{}
+if ($vs) {
+  foreach ($pn in $props) {
+    try { $v = $vs.Get($pn); if ($v -is [array]) { $v = $v -join '; ' }; $cfg[$pn] = $v } catch { }
+  }
+  ShowList ([pscustomobject]$cfg)
+  $summary['SmartHost']      = "$($cfg['SmartHost'])  (type $($cfg['SmartHostType']))"
+  $summary['Outbound port']  = "$($cfg['RemoteSmtpPort'])"
+  $summary['MaxOutConn']     = "$($cfg['MaxOutConnections']) total / $($cfg['MaxOutConnectionsPerDomain']) per domain"
+
+  Write-Host "Domains under virtual server 1:"
+  try {
+    $dom = [ADSI]"IIS://localhost/SMTPSVC/1/Domain"
+    $rows = foreach ($d in $dom.psbase.Children) {
+      $ra = $null; try { $ra = $d.Get('RouteAction') } catch {}
+      $rs = $null; try { $rs = $d.Get('RouteActionString') } catch {}
+      [pscustomobject]@{ Name = $d.Name; Class = $d.SchemaClassName; RouteAction = $ra; RouteTo = $rs }
+    }
+    Show $rows
+  } catch { Write-Host "  could not enumerate domains: $($_.Exception.Message)" }
+}
+
+Write-Host "Metabase.xml SMTP settings (passwords removed):"
+$mb = "$env:windir\System32\inetsrv\MetaBase.xml"
+if (Test-Path $mb) {
+  try {
+    [xml]$x = Get-Content $mb -Raw
+    $nodes = $x.SelectNodes("//*[@Location and starts-with(@Location,'/LM/SMTPSVC/1')]")
+    foreach ($n in $nodes) {
+      Write-Host "  [$($n.LocalName)] $($n.GetAttribute('Location'))"
+      foreach ($a in $n.Attributes) {
+        if ($a.Name -match 'Password|Secret|Key') { continue }
+        if ($a.Name -match 'Smart|Route|Remote|Out|Secur|Tls|Ssl|Relay|Binding|Port|Max|Limit|Retry|Fqdn|FullyQualified|Domain|Auth|Masquerade|Hop|Directory') {
+          $val = $a.Value; if ($val.Length -gt 120) { $val = $val.Substring(0,120) + '...' }
+          Write-Host ("      {0} = {1}" -f $a.Name, $val)
+        }
+      }
+    }
+  } catch { Write-Host "  could not parse Metabase.xml: $($_.Exception.Message)" }
+} else { Write-Host "  $mb not found" }
+
+# ---------------------------------------------------------------------------
+Section "4. MAIL FOLDERS"
+$mailroot = 'C:\inetpub\mailroot'
+$dirs = [ordered]@{
+  Queue   = $(if ($cfg['QueueDirectory'])   { $cfg['QueueDirectory'] }   else { "$mailroot\Queue" })
+  Badmail = $(if ($cfg['BadMailDirectory']) { $cfg['BadMailDirectory'] } else { "$mailroot\Badmail" })
+  Drop    = $(if ($cfg['DropDirectory'])    { $cfg['DropDirectory'] }    else { "$mailroot\Drop" })
+  Pickup  = $(if ($cfg['PickupDirectory'])  { $cfg['PickupDirectory'] }  else { "$mailroot\Pickup" })
+}
+$folderRows = foreach ($k in $dirs.Keys) {
+  $f = @(Get-ChildItem $dirs[$k] -File -ErrorAction SilentlyContinue)
+  [pscustomobject]@{ Folder = $k; Path = $dirs[$k]; Files = $f.Count
+    Oldest = ($f | Sort-Object LastWriteTime | Select-Object -First 1).LastWriteTime
+    Newest = ($f | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime }
+}
+Show $folderRows
+$summary['Queue count (start)'] = ($folderRows | Where-Object Folder -eq 'Queue').Files
+$oldest = Get-ChildItem $dirs.Queue -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -First 1
+if ($oldest) {
+  Write-Host "Headers of oldest queued message ($($oldest.Name)):"
+  foreach ($line in (Get-Content $oldest.FullName -TotalCount 25)) { if ($line -eq '') { break }; Write-Host "  $line" }
+}
+$bdr = Get-ChildItem $dirs.Badmail -Filter *.bdr -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 2
+foreach ($b in $bdr) { Write-Host "Badmail reason ($($b.Name)):"; Get-Content $b.FullName -TotalCount 15 | ForEach-Object { Write-Host "  $_" } }
+
+# ---------------------------------------------------------------------------
+Section "5. SMTP LOG (newest file, last 40 lines)"
+$logRoot = $(if ($cfg['LogFileDirectory']) { $cfg['LogFileDirectory'] } else { "$env:windir\System32\LogFiles" })
+$logDir  = Join-Path $logRoot 'SmtpSvc1'
+$logFile = Get-ChildItem $logDir -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($logFile) {
+  Write-Host "File: $($logFile.FullName)"
+  Get-Content $logFile.FullName | Where-Object { $_ -match '^#Fields' } | Select-Object -Last 1 | ForEach-Object { Write-Host "  $_" }
+  Get-Content $logFile.FullName -Tail 40 | ForEach-Object { Write-Host "  $_" }
+  $outLines = @(Select-String -Path $logFile.FullName -Pattern 'Outbound' -ErrorAction SilentlyContinue).Count
+  Write-Host "Outbound lines in this file: $outLines"
+  $summary['Outbound log lines'] = $outLines
+} else { Write-Host "No log file in $logDir (is logging enabled?)"; $summary['Outbound log lines'] = 'no log file' }
+
+# ---------------------------------------------------------------------------
+Section "6. EVENT LOG - last 24h (smtpsvc + Schannel)"
+$since = (Get-Date).AddDays(-1)
+foreach ($prov in 'smtpsvc','Schannel') {
+  Write-Host "--- $prov ---"
+  $ev = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = $prov; StartTime = $since } -ErrorAction SilentlyContinue |
+        Select-Object -First 25 TimeCreated, Id, LevelDisplayName, @{n='Message';e={ ($_.Message -replace '\s+',' ').Substring(0, [Math]::Min(300, ($_.Message -replace '\s+',' ').Length)) }}
+  Show $ev
+}
+
+# ---------------------------------------------------------------------------
+Section "7. TLS / SCHANNEL SETTINGS"
+$base = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL'
+$tlsRows = foreach ($proto in 'SSL 3.0','TLS 1.0','TLS 1.1','TLS 1.2','TLS 1.3') {
+  foreach ($side in 'Client','Server') {
+    $k = "$base\Protocols\$proto\$side"
+    if (Test-Path $k) { $v = Get-ItemProperty $k
+      [pscustomobject]@{ Protocol = $proto; Side = $side; Enabled = $v.Enabled; DisabledByDefault = $v.DisabledByDefault } }
+  }
+}
+Show $tlsRows
+Write-Host "Schannel EventLogging = $((Get-ItemProperty $base -ErrorAction SilentlyContinue).EventLogging)"
+foreach ($nk in 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319','HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319') {
+  $v = Get-ItemProperty $nk -ErrorAction SilentlyContinue
+  Write-Host "$nk : SchUseStrongCrypto=$($v.SchUseStrongCrypto) SystemDefaultTlsVersions=$($v.SystemDefaultTlsVersions)"
+}
+$gpo = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002' -ErrorAction SilentlyContinue).Functions
+Write-Host "Cipher suite order set by GPO: $(if ($gpo) { 'YES' } else { 'no' })"
+try { Write-Host "Top cipher suites:"; Get-TlsCipherSuite | Select-Object -First 12 | ForEach-Object { Write-Host "  $($_.Name)" } } catch {}
+
+# ---------------------------------------------------------------------------
+Section "8. DNS - normal Windows lookup vs DNS-only (what IIS SMTP uses)"
+$ips = New-Object System.Collections.Generic.List[string]
+foreach ($i in 1..5) {
+  foreach ($mode in 'Normal','DnsOnly') {
+    try {
+      $res = if ($mode -eq 'Normal') { Resolve-DnsName $RelayName -Type A -ErrorAction Stop } else { Resolve-DnsName $RelayName -Type A -DnsOnly -NoHostsFile -ErrorAction Stop }
+      $a = ($res | Where-Object Type -eq 'A').IPAddress
+      $c = ($res | Where-Object Type -eq 'CNAME').NameHost
+      Write-Host ("  try {0} {1,-8}: A={2}  CNAME={3}" -f $i, $mode, ($a -join ','), ($c -join ','))
+      foreach ($ip in $a) { if (-not $ips.Contains($ip)) { $ips.Add($ip) } }
+    } catch { Write-Host "  try $i $mode : FAILED - $($_.Exception.Message)" }
+  }
+}
+try { $mx = Resolve-DnsName $RelayName -Type MX -DnsOnly -ErrorAction Stop | Where-Object Type -eq 'MX'; Write-Host "  MX records: $(if ($mx) { ($mx.NameExchange -join ', ') } else { 'none' })" } catch { Write-Host "  MX lookup: $($_.Exception.Message)" }
+foreach ($h in $ExtraHosts) {
+  try { $a = (Resolve-DnsName $h -Type A -ErrorAction Stop | Where-Object Type -eq 'A').IPAddress; Write-Host "  $h -> $($a -join ',')" } catch { Write-Host "  $h -> FAILED" }
+}
+$summary['Relay IPs seen'] = $ips -join ', '
+
+# ---------------------------------------------------------------------------
+Section "9. TCP + STARTTLS PROBE to every relay IP (no mail is sent)"
+function Invoke-StartTlsProbe {
+  param([string]$Ip, [string]$Name, [int]$Port)
+  $r = [ordered]@{ Target = "${Ip}:$Port"; Tcp = $null; Banner = $null; StartTlsOffered = $null; AuthOffered = $null
+                   Protocol = $null; Cipher = $null; CertSubject = $null; CertSAN = $null; Issuer = $null; Expires = $null
+                   NameCheck = $null; ChainAsThisUser = $null; Error = $null }
+  $tcp = New-Object System.Net.Sockets.TcpClient
+  try {
+    $iar = $tcp.BeginConnect($Ip, $Port, $null, $null)
+    if (-not $iar.AsyncWaitHandle.WaitOne(8000)) { $r.Tcp = 'TIMEOUT'; throw 'TCP connect timeout' }
+    $tcp.EndConnect($iar); $r.Tcp = 'OK'
+    $tcp.ReceiveTimeout = 15000; $tcp.SendTimeout = 15000
+    $ns = $tcp.GetStream()
+    $rd = New-Object System.IO.StreamReader($ns, [Text.Encoding]::ASCII)
+    $wr = New-Object System.IO.StreamWriter($ns, [Text.Encoding]::ASCII); $wr.AutoFlush = $true; $wr.NewLine = "`r`n"
+    $readResp = { $lines = @(); do { $l = $rd.ReadLine(); if ($null -eq $l) { break }; $lines += $l } while ($l -match '^\d{3}-'); $lines }
+    $r.Banner = (& $readResp) -join ' | '
+    $fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName
+    $wr.WriteLine("EHLO $fqdn"); $ehlo = & $readResp
+    $r.StartTlsOffered = [bool]($ehlo -match 'STARTTLS')
+    $r.AuthOffered     = (($ehlo | Where-Object { $_ -match 'AUTH' }) -join ' / ')
+    $wr.WriteLine('STARTTLS'); $st = (& $readResp) -join ' '
+    if ($st -notmatch '^220') { throw "STARTTLS refused: $st" }
+    $script:pErr = $null; $script:pCert = $null
+    $cb = [System.Net.Security.RemoteCertificateValidationCallback]{ param($s, $c, $ch, $e) $script:pErr = $e; $script:pCert = $c; $true }
+    $ssl = New-Object System.Net.Security.SslStream($ns, $false, $cb)
+    $ssl.AuthenticateAsClient($Name, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false)
+    $r.Protocol = "$($ssl.SslProtocol)"
+    $r.Cipher   = "$($ssl.CipherAlgorithm) $($ssl.CipherStrength) / $($ssl.KeyExchangeAlgorithm) / $($ssl.HashAlgorithm)"
+    $c2 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($script:pCert)
+    $r.CertSubject = $c2.Subject; $r.Issuer = $c2.Issuer; $r.Expires = $c2.NotAfter
+    $san = $c2.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' }
+    if ($san) { $r.CertSAN = $san.Format($false) }
+    $r.NameCheck = "$($script:pErr)"
+    $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+    $chain.ChainPolicy.RevocationMode = 'Online'
+    $chain.ChainPolicy.UrlRetrievalTimeout = [TimeSpan]::FromSeconds(15)
+    $r.ChainAsThisUser = if ($chain.Build($c2)) { 'OK' } else { (($chain.ChainStatus | ForEach-Object { $_.Status }) -join ', ') }
+    try { $ssl.Close() } catch {}
+  } catch { $r.Error = $_.Exception.Message } finally { $tcp.Close() }
+  [pscustomobject]$r
+}
+$probeTargets = @($ips)
+foreach ($h in $ExtraHosts) { try { $probeTargets += (Resolve-DnsName $h -Type A -ErrorAction Stop | Where-Object Type -eq 'A').IPAddress } catch {} }
+$probeTargets = $probeTargets | Select-Object -Unique
+$probeResults = foreach ($ip in $probeTargets) { Invoke-StartTlsProbe -Ip $ip -Name $RelayName -Port $RelayPort }
+ShowList $probeResults
+$summary['STARTTLS probe'] = ($probeResults | ForEach-Object { "$($_.Target)=$(if ($_.Error) { 'ERR: ' + $_.Error } else { $_.Protocol + ' name:' + $_.NameCheck + ' chain:' + $_.ChainAsThisUser })" }) -join ' || '
+
+# ---------------------------------------------------------------------------
+Section "10. FIREWALL + SECURITY SOFTWARE"
+Show (Get-NetFirewallProfile -PolicyStore ActiveStore | Select-Object Name, Enabled, DefaultOutboundAction, LogBlocked, LogFileName)
+$summary['FW default outbound'] = ((Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object { "$($_.Name)=$($_.DefaultOutboundAction)" }) -join ' ')
+Write-Host "Firewall rules that mention inetinfo.exe:"
+try {
+  $inet = Get-NetFirewallApplicationFilter -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.Program -match 'inetinfo' }
+  if ($inet) { Show ($inet | Get-NetFirewallRule | Select-Object DisplayName, Direction, Action, Enabled) } else { Write-Host "  (none)" }
+} catch { Write-Host "  could not read: $($_.Exception.Message)" }
+Write-Host "Outbound BLOCK rules (enabled):"
+Show (Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Block -Enabled True -ErrorAction SilentlyContinue | Select-Object -First 20 DisplayName, Profile)
+Write-Host "Security / network agents installed (services):"
+$sec = Get-Service | Where-Object { $_.DisplayName -match 'McAfee|Trellix|Symantec|CrowdStrike|Falcon|SentinelOne|Carbon Black|Cortex|Traps|Trend|Sophos|ESET|Defender|Tanium|Cylance|Forcepoint|Zscaler|Netskope|Palo Alto|Cisco|Qualys|Tenable|Ivanti|BeyondTrust|CyberArk' }
+Show ($sec | Select-Object Name, DisplayName, Status)
+$summary['Security agents'] = (($sec | Where-Object Status -eq 'Running').DisplayName -join '; ')
+
+# ---------------------------------------------------------------------------
+if ($LiveTest) {
+  Section "11. LIVE TEST - restart SMTPSVC, send test mail, watch outbound connections ($WatchSeconds s)"
+  $subs = 'Filtering Platform Connection','Filtering Platform Packet Drop'
+  $prevAudit = @{}
+  foreach ($s in $subs) { $prevAudit[$s] = ((auditpol /get /subcategory:"$s") -join ' ') -match 'Failure'
+                          auditpol /set /subcategory:"$s" /failure:enable | Out-Null }
+  $start = Get-Date
+  Write-Host "Start: $($start.ToString('HH:mm:ss'))  (UTC $($start.ToUniversalTime().ToString('HH:mm:ss')))"
+  Restart-Service SMTPSVC -Force
+  Start-Sleep -Seconds 3
+  try {
+    $c = New-Object System.Net.Mail.SmtpClient('127.0.0.1', 25)
+    $c.Send($From, $To, "SMTP diag $stamp", "Diagnostic test mail sent at $(Get-Date -Format s) from $env:COMPUTERNAME")
+    Write-Host "Test mail accepted by local SMTP (127.0.0.1:25)"
+    $summary['Local submit'] = 'OK'
+  } catch { Write-Host "Local submit FAILED: $($_.Exception.Message)"; $summary['Local submit'] = "FAILED: $($_.Exception.Message)" }
+
+  $seen = [ordered]@{}
+  $end = (Get-Date).AddSeconds($WatchSeconds)
+  while ((Get-Date) -lt $end) {
+    Get-NetTCPConnection -ErrorAction SilentlyContinue |
+      Where-Object { $_.RemotePort -in 25, 465, 587 -and $_.RemoteAddress -notmatch '^(127\.|::1|0\.0\.0\.0|::$)' } |
+      ForEach-Object {
+        $pn = (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).Name
+        $key = "{0}:{1} {2} pid={3} {4}" -f $_.RemoteAddress, $_.RemotePort, $_.State, $_.OwningProcess, $pn
+        if (-not $seen.Contains($key)) { $seen[$key] = (Get-Date).ToString('HH:mm:ss.fff') }
+      }
+    Start-Sleep -Milliseconds 200
+  }
+  Write-Host "Outbound mail-port connections observed:"
+  if ($seen.Count) { foreach ($k in $seen.Keys) { Write-Host "  $($seen[$k])  $k" } } else { Write-Host "  NONE" }
+  $summary['Outbound conns seen'] = if ($seen.Count) { ($seen.Keys -join ' || ') } else { 'NONE' }
+
+  Write-Host "Windows Filtering Platform blocks (5157/5152) since start:"
+  $wfp = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 5157, 5152; StartTime = $start } -ErrorAction SilentlyContinue |
+    Where-Object { $_.Message -match 'inetinfo' -or $_.Message -match 'Destination Port:\s+(25|465|587)\s' } |
+    Select-Object -First 15 | ForEach-Object {
+      $m = $_.Message
+      [pscustomobject]@{
+        Time     = $_.TimeCreated.ToString('HH:mm:ss')
+        Id       = $_.Id
+        App      = [regex]::Match($m, 'Application Name:\s+(\S+)').Groups[1].Value
+        Dest     = [regex]::Match($m, 'Destination Address:\s+(\S+)').Groups[1].Value
+        DPort    = [regex]::Match($m, 'Destination Port:\s+(\d+)').Groups[1].Value
+        FilterId = [regex]::Match($m, 'Filter Run-Time ID:\s+(\d+)').Groups[1].Value
+        Layer    = [regex]::Match($m, 'Layer Name:\s+([^\r\n]+)').Groups[1].Value.Trim()
+      } }
+  Show $wfp
+  $summary['WFP blocks'] = if ($wfp) { "YES ($(@($wfp).Count)) app=$((@($wfp))[0].App)" } else { 'none' }
+
+  $fids = @($wfp | Where-Object FilterId | Select-Object -ExpandProperty FilterId -Unique)
+  if ($fids.Count) {
+    $fx = Join-Path $OutDir "wfp-filters-$stamp.xml"
+    netsh wfp show filters file="$fx" | Out-Null
+    try {
+      [xml]$fxml = Get-Content $fx -Raw
+      foreach ($id in $fids) {
+        $item = $fxml.SelectNodes("//item[filterId='$id']") | Select-Object -First 1
+        if ($item) { Write-Host "  Filter $id = '$($item.displayData.name)' / '$($item.displayData.description)'  provider=$($item.providerKey)" }
+        else { Write-Host "  Filter $id not found in $fx" }
+      }
+    } catch { Write-Host "  could not parse $fx" }
+  }
+
+  foreach ($s in $subs) { if (-not $prevAudit[$s]) { auditpol /set /subcategory:"$s" /failure:disable | Out-Null } }
+  Write-Host "Audit policy restored."
+
+  Write-Host "New smtpsvc / Schannel events since start:"
+  Show (Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'smtpsvc', 'Schannel'; StartTime = $start } -ErrorAction SilentlyContinue |
+        Select-Object TimeCreated, ProviderName, Id, LevelDisplayName, @{n='Message';e={ ($_.Message -replace '\s+',' ') }})
+
+  $logFile = Get-ChildItem $logDir -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if ($logFile) { Write-Host "SMTP log tail after test ($($logFile.Name)):"; Get-Content $logFile.FullName -Tail 25 | ForEach-Object { Write-Host "  $_" } }
+
+  $qAfter = @(Get-ChildItem $dirs.Queue -File -ErrorAction SilentlyContinue).Count
+  $bAfter = @(Get-ChildItem $dirs.Badmail -File -ErrorAction SilentlyContinue).Count
+  Write-Host "Queue files now: $qAfter   Badmail files now: $bAfter"
+  $summary['Queue count (end)'] = $qAfter
+}
+
+# ---------------------------------------------------------------------------
+Section "SUMMARY"
+foreach ($k in $summary.Keys) { Write-Host ("{0,-22}: {1}" -f $k, $summary[$k]) }
+Write-Host ""
+Write-Host "Full output saved to: $outFile"
+Stop-Transcript | Out-Null

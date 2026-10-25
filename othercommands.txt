@@ -1,0 +1,52 @@
+Check Server Connectivity
+Test-NetConnection mailrelay.eu.testnet.com -Port 587
+If TcpTestSucceeded is False, a firewall is blocking port 587 from this server.
+
+What main relay supports
+telnet mailrelay.eu.testnet.com 587
+EHLO server.oc.testnet.com
+
+Check the 250- lines in the reply:
+No STARTTLS line: this port doesn’t offer TLS. Ask the mail team which port does; it may be 25.
+An AUTH LOGIN or AUTH PLAIN line: 587 almost certainly requires a login, and your relay is connecting anonymously. This is the most likely cause.
+Type QUIT to close the session.
+
+What each result shows
+
+Event 2001 (Information) has nothing to do with this. It’s about incoming TLS: your local server has no certificate, so it can’t offer TLS to clients connecting to it. That’s fine, because BizTalk talks to it over loopback in plain text. Outbound TLS to the main relay doesn’t need a certificate on your side.
+The network is fine. TcpTestSucceeded: True, so port 587 is open from 172.18.219.22.
+The telnet reply is the giveaway. The relay offers STARTTLS, so TLS on the outbound hop is possible. It also offers AUTH PLAIN LOGIN, which on port 587 nearly always means a login is required. Your Outbound Security is set to Anonymous, so the relay refuses the mail and your server keeps retrying, which is why it sits in the Queue folder.
+
+It also only lists PLAIN and LOGIN, with no NTLM, so the Integrated Windows Authentication option won’t work against this relay. It has to be Basic authentication.
+
+Confirm it in about 30 seconds
+
+In the same telnet session, after the EHLO reply, type:
+
+MAIL FROM:<noreplysydney@testbank.com>
+
+If you get a 530 5.7.x Authentication required reply, that confirms it. Type QUIT to close the session.
+
+In the same telnet session, type:
+RCPT TO:<faisal.kamali@testbank.com>
+
+If you get 530 / 550 5.7.x (relay denied or authentication required): login is the problem. Apply the Basic authentication fix from my last message.
+
+If you get 250 recipient ok: the relay accepts you anonymously, so login isn’t the problem. That leaves the TLS handshake as the main suspect. Type QUIT and do the following.
+
+
+Next step: test TLS directly from server
+
+Run this in PowerShell on the server:
+
+[Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+$c = New-Object System.Net.Mail.SmtpClient('mailrelay.eu.testnet.com', 587)
+$c.EnableSsl = $true
+$c.Send('noreplysydney@testbank.com','faisal.kamali@testbank.com','TLS test','test')
+
+Check whether TLS 1.2 is off for Schannel clients
+
+powershell
+(Get-CimInstance Win32_OperatingSystem).Caption
+Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols' -Recurse
+
